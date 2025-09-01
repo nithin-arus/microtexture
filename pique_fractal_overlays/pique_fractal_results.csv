@@ -1,0 +1,6 @@
+filename,path,overlay_path,fractal_equation,hurst_exponent,amplitude_scaling,goodness_of_fit,fitting_success
+pique_polo_20250726_210936.jpg,capture/images/pique_polo/pique_polo_20250726_210936.jpg,pique_fractal_overlays/pique_polo_pique_polo_20250726_210936_fractal_overlay_20250831_162351.png,"fBm(H=0.900, σ=1.000)",0.9,1.0,0.988548,True
+pique_polo_20250726_210941.jpg,capture/images/pique_polo/pique_polo_20250726_210941.jpg,pique_fractal_overlays/pique_polo_pique_polo_20250726_210941_fractal_overlay_20250831_162353.png,"fBm(H=0.900, σ=1.000)",0.9,0.999751,0.988104,True
+pique_polo_20250726_210946.jpg,capture/images/pique_polo/pique_polo_20250726_210946.jpg,pique_fractal_overlays/pique_polo_pique_polo_20250726_210946_fractal_overlay_20250831_162354.png,"fBm(H=0.900, σ=1.000)",0.9,1.000004,0.987822,True
+pique_polo_20250726_210951.jpg,capture/images/pique_polo/pique_polo_20250726_210951.jpg,pique_fractal_overlays/pique_polo_pique_polo_20250726_210951_fractal_overlay_20250831_162355.png,"fBm(H=0.900, σ=1.000)",0.9,1.000204,0.987094,True
+pique_polo_20250726_210956.jpg,capture/images/pique_polo/pique_polo_20250726_210956.jpg,pique_fractal_overlays/pique_polo_pique_polo_20250726_210956_fractal_overlay_20250831_162356.png,"fBm(H=0.900, σ=1.000)",0.9,1.0,0.988425,True

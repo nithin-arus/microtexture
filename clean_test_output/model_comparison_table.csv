@@ -1,0 +1,6 @@
+Model,Accuracy,Macro F1,Macro Prec.,Macro Rec.,AUROC,CV Mean,CV Std
+Svm,0.974,0.940,0.933,0.950,1.000,0.987,0.016
+Random Forest,0.974,0.940,0.933,0.950,1.000,1.000,0.000
+Logistic Regression,0.974,0.940,0.933,0.950,0.949,0.987,0.026
+Mlp,0.974,0.940,0.933,0.950,0.949,0.994,0.013
+Isolation Forest,—,—,1.000,0.108,0.486,F1: 0.195,Anom: 4
