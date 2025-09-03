@@ -51,7 +51,7 @@ CSV_HEADERS = [
     # Morphological features
     "area_coverage", "circularity", "solidity", "perimeter_complexity",
     
-    # NEW: Fractal surface fitting parameters
+    # Fractal surface fitting parameters
     "fractal_equation", "fractal_hurst_exponent", "fractal_amplitude_scaling", 
     "fractal_goodness_of_fit", "fractal_fitting_success", "fractal_overlay_path"
 ]
