@@ -16,44 +16,45 @@ IMAGE_ROOT = "capture/images"
 CSV_PATH = "data/features.csv"
 
 # Complete list of all features that will be extracted (now with fractal fitting)
+# Note: variance removed (redundant with std_dev), haralick_asm removed (duplicate of haralick_energy)
 CSV_HEADERS = [
     # Basic info
     "filename", "path", "label",
     
-    # Basic statistical features
-    "mean_intensity", "std_dev", "variance", "skewness", "kurtosis", 
+    # Basic statistical features (7 features)
+    "mean_intensity", "std_dev", "skewness", "kurtosis", 
     "range_intensity", "min_intensity", "max_intensity",
     
-    # Entropy measures
+    # Entropy measures (2 features)
     "entropy_shannon", "entropy_local",
     
-    # Edge features
+    # Edge features (4 features)
     "edge_density", "edge_magnitude_mean", "edge_magnitude_std", "edge_orientation_std",
     
-    # Haralick texture features (GLCM-based)
+    # Haralick texture features (5 features, ASM removed as duplicate of energy)
     "haralick_contrast", "haralick_dissimilarity", "haralick_homogeneity", 
-    "haralick_energy", "haralick_correlation", "haralick_asm",
+    "haralick_energy", "haralick_correlation",
     
-    # Local Binary Pattern features
+    # Local Binary Pattern features (3 features)
     "lbp_uniform_mean", "lbp_variance", "lbp_entropy",
     
-    # Fractal dimension measures
+    # Fractal dimension measures (5 features)
     "fractal_dim_higuchi", "fractal_dim_katz", "fractal_dim_dfa", 
     "fractal_dim_boxcount", "lacunarity",
     
-    # Wavelet features
+    # Wavelet features (5 features)
     "wavelet_energy_approx", "wavelet_energy_horizontal", "wavelet_energy_vertical", 
     "wavelet_energy_diagonal", "wavelet_entropy",
     
-    # Tamura texture features
+    # Tamura texture features (3 features)
     "tamura_coarseness", "tamura_contrast", "tamura_directionality",
     
-    # Morphological features
+    # Morphological features (4 features)
     "area_coverage", "circularity", "solidity", "perimeter_complexity",
     
     # Fractal surface fitting parameters
     "fractal_equation", "fractal_hurst_exponent", "fractal_amplitude_scaling", 
-    "fractal_goodness_of_fit", "fractal_fitting_success", "fractal_overlay_path"
+    "fractal_spectrum_corr", "fractal_spectrum_rmse", "fractal_fitting_success", "fractal_overlay_path"
 ]
 
 def write_header_if_needed(csv_path):
@@ -234,8 +235,8 @@ def show_feature_info():
     print()
     
     feature_groups = {
-        "Basic Statistical Features (8)": [
-            "mean_intensity", "std_dev", "variance", "skewness", "kurtosis", 
+        "Basic Statistical Features (7)": [
+            "mean_intensity", "std_dev", "skewness", "kurtosis", 
             "range_intensity", "min_intensity", "max_intensity"
         ],
         "Entropy Measures (2)": [
@@ -244,9 +245,9 @@ def show_feature_info():
         "Edge & Gradient Features (4)": [
             "edge_density", "edge_magnitude_mean", "edge_magnitude_std", "edge_orientation_std"
         ],
-        "Haralick Texture Features (6)": [
+        "Haralick Texture Features (5)": [
             "haralick_contrast", "haralick_dissimilarity", "haralick_homogeneity", 
-            "haralick_energy", "haralick_correlation", "haralick_asm"
+            "haralick_energy", "haralick_correlation"
         ],
         "Local Binary Pattern Features (3)": [
             "lbp_uniform_mean", "lbp_variance", "lbp_entropy"
@@ -265,9 +266,9 @@ def show_feature_info():
         "Morphological Features (4)": [
             "area_coverage", "circularity", "solidity", "perimeter_complexity"
         ],
-        "🆕 NEW: Fractal Surface Fitting (5)": [
+        "🆕 NEW: Fractal Surface Fitting (6)": [
             "fractal_equation", "fractal_hurst_exponent", "fractal_amplitude_scaling",
-            "fractal_goodness_of_fit", "fractal_fitting_success"
+            "fractal_spectrum_corr", "fractal_spectrum_rmse", "fractal_fitting_success"
         ],
         "🆕 NEW: Visualization Output (1)": [
             "fractal_overlay_path"

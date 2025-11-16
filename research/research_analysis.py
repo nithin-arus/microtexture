@@ -11,10 +11,13 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import umap
+import hashlib
+import json
 
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple
 
 # Import our custom analysis modules
 from .models.supervised_models import SupervisedModelSuite
@@ -26,6 +29,17 @@ from .evaluation.evaluators import ModelEvaluator
 from .utils.data_utils import DataProcessor
 from .utils.sample_aware_splitting import SampleAwareSplitter
 from .utils.advanced_feature_selection import AdvancedFeatureSelector, HyperparameterOptimizer
+
+# Import new utilities
+from .utils.determinism import set_global_seeds
+from .utils.data_manifest import load_manifest, encode_labels, validate_labels
+from .utils.schema_migration import auto_fix_schema, check_feature_schema
+from .utils.split_reporting import split_stats
+from .utils.result_serializer import serialize_results
+from .utils.captions import build_caption
+from .evaluation.stat_tests import compare_configurations, ci95
+from .evaluation.diagnostics import confusion_matrix_report, per_class_metrics
+from .evaluation.feature_importance import compute_permutation_importance, analyze_feature_correlations
 
 # Import augmentation modules
 import sys
@@ -50,7 +64,8 @@ class ResearchAnalyzer:
     - Statistical analysis
     """
     
-    def __init__(self, data_path="data/features.csv", output_dir="research_output"):
+    def __init__(self, data_path="data/features.csv", output_dir="research_output", 
+                 manifest_path=None, deep_features_path=None):
         """
         Initialize the research analyzer for fabric analysis
         
@@ -60,8 +75,14 @@ class ResearchAnalyzer:
             Path to the CSV file containing extracted features
         output_dir : str
             Directory to save all research outputs
+        manifest_path : str, optional
+            Path to manifest CSV with filename,label columns for label integrity
+        deep_features_path : str, optional
+            Path to deep features CSV (if using deep or hybrid modes)
         """
         self.data_path = data_path
+        self.manifest_path = manifest_path
+        self.deep_features_path = deep_features_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
@@ -70,6 +91,7 @@ class ResearchAnalyzer:
         (self.output_dir / "visualizations").mkdir(exist_ok=True)
         (self.output_dir / "evaluation").mkdir(exist_ok=True)
         (self.output_dir / "statistical_analysis").mkdir(exist_ok=True)
+        (self.output_dir / "splits").mkdir(exist_ok=True)
         
         # Initialize components
         self.data_processor = DataProcessor()
@@ -98,10 +120,23 @@ class ResearchAnalyzer:
         
         # Data storage
         self.features_df = None
+        self.deep_features_df = None
+        self.manifest_dict = None
+        self.class_names = None
         self.X = None
         self.y = None
+        self.y_encoded = None
         self.feature_names = None
+        self.label_encoder = None
         self.scaler = StandardScaler()
+        
+        # Configuration
+        self.config = {
+            'data_path': data_path,
+            'manifest_path': manifest_path,
+            'deep_features_path': deep_features_path,
+            'output_dir': str(output_dir)
+        }
         
         # Results storage
         self.results = {
@@ -118,16 +153,21 @@ class ResearchAnalyzer:
             'advanced_visualizations': []
         }
     
-    def load_and_prepare_data(self, target_column=None, create_synthetic_labels=True):
+    def load_and_prepare_data(self, target_column=None, create_synthetic_labels=True,
+                            use_manifest=True, migrate_schema=True):
         """
-        Load feature data and prepare for analysis
+        Load feature data and prepare for analysis with manifest support and schema migration
         
         Parameters:
         -----------
         target_column : str, optional
-            Column name to use as target variable
+            Column name to use as target variable (default: 'label')
         create_synthetic_labels : bool
             If True and no target_column, create synthetic labels for demonstration
+        use_manifest : bool
+            If True and manifest_path provided, use manifest for label integrity
+        migrate_schema : bool
+            If True, auto-fix schema by removing legacy features
         """
         print("Loading and preparing feature data...")
         
@@ -136,21 +176,109 @@ class ResearchAnalyzer:
             raise FileNotFoundError(f"Features file not found: {self.data_path}")
         
         self.features_df = pd.read_csv(self.data_path)
-        print(f"Loaded {len(self.features_df)} samples with {len(self.features_df.columns)} features")
+        print(f"Loaded {len(self.features_df)} samples with {len(self.features_df.columns)} columns")
+        
+        # Migrate schema if requested
+        if migrate_schema:
+            print("Migrating feature schema...")
+            self.features_df = auto_fix_schema(self.features_df, log_migrations=True)
+        
+        # Load manifest if provided
+        if use_manifest and self.manifest_path and os.path.exists(self.manifest_path):
+            print(f"Loading manifest from {self.manifest_path}...")
+            try:
+                self.manifest_dict, self.class_names = load_manifest(self.manifest_path)
+                print(f"Loaded manifest with {len(self.manifest_dict)} entries, {len(self.class_names)} classes")
+                
+                # Validate labels
+                mismatches = validate_labels(self.features_df, self.manifest_dict)
+                if mismatches:
+                    print(f"Warning: Found {len(mismatches)} label mismatches")
+                else:
+                    print("✓ Label validation passed")
+                
+                # Override labels from manifest
+                if 'filename' in self.features_df.columns:
+                    self.features_df['label'] = self.features_df['filename'].map(self.manifest_dict)
+                    # Remove rows without labels in manifest
+                    self.features_df = self.features_df.dropna(subset=['label'])
+                    print(f"Updated labels from manifest: {len(self.features_df)} samples")
+            except Exception as e:
+                print(f"Warning: Manifest loading failed: {e}")
+                use_manifest = False
+        
+        # Merge deep features if provided (do this early to ensure alignment)
+        if self.deep_features_path and Path(self.deep_features_path).exists():
+            print(f"Loading deep features from {self.deep_features_path}...")
+            try:
+                deep_df = pd.read_csv(self.deep_features_path)
+                print(f"Loaded deep features: {deep_df.shape}")
+                
+                # Merge with main dataframe on filename
+                if 'filename' in self.features_df.columns and 'filename' in deep_df.columns:
+                    # Store original length
+                    original_len = len(self.features_df)
+                    
+                    # Merge
+                    self.features_df = self.features_df.merge(
+                        deep_df, on='filename', how='inner', suffixes=('', '_deep')
+                    )
+                    
+                    if len(self.features_df) != original_len:
+                        print(f"Warning: Merge reduced samples from {original_len} to {len(self.features_df)}")
+                    else:
+                        print(f"Successfully merged deep features: {len(self.features_df)} samples")
+                    
+                    # Store deep feature column names for later use
+                    self.deep_feature_cols = [col for col in deep_df.columns 
+                                            if col.startswith('feat_') and col not in ['filename', 'label']]
+                    print(f"Deep feature columns: {len(self.deep_feature_cols)} features")
+                else:
+                    print("Warning: Cannot merge deep features (filename column missing)")
+                    self.deep_feature_cols = None
+            except Exception as e:
+                print(f"Warning: Failed to merge deep features: {e}")
+                self.deep_feature_cols = None
+        
+        # Use target_column or default to 'label'
+        if target_column is None:
+            target_column = 'label' if 'label' in self.features_df.columns else None
         
         # Process data using DataProcessor
         self.X, self.y, self.feature_names = self.data_processor.prepare_features(
             self.features_df, target_column, create_synthetic_labels
         )
         
+        # Encode labels if they're strings (after merge, so indices align)
+        if self.y is not None:
+            if isinstance(self.y[0], str) or (hasattr(self.y, 'dtype') and self.y.dtype == object):
+                self.y_encoded, self.label_encoder, self.class_names = encode_labels(
+                    self.y, encoder_path=str(self.output_dir / "label_encoder.pkl")
+                )
+                print(f"Encoded labels: {len(self.class_names)} classes")
+                print(f"Classes: {self.class_names}")
+            else:
+                self.y_encoded = self.y
+                # Create encoder from unique labels
+                unique_labels = np.unique(self.y)
+                self.label_encoder = LabelEncoder()
+                self.label_encoder.fit(unique_labels)
+                self.class_names = self.label_encoder.classes_.tolist()
+            
+            # Verify alignment
+            assert len(self.y_encoded) == len(self.features_df), \
+                f"Label length ({len(self.y_encoded)}) doesn't match features_df length ({len(self.features_df)})"
+            assert len(self.X) == len(self.features_df), \
+                f"Feature matrix length ({len(self.X)}) doesn't match features_df length ({len(self.features_df)})"
+        
         print(f"Prepared feature matrix: {self.X.shape}")
         print(f"Feature names: {len(self.feature_names)}")
         
-        if self.y is not None:
-            unique_labels = np.unique(self.y)
-            print(f"Target labels: {unique_labels} (counts: {np.bincount(self.y)})")
+        if self.y_encoded is not None:
+            unique_labels = np.unique(self.y_encoded)
+            print(f"Target labels: {unique_labels} (counts: {np.bincount(self.y_encoded)})")
         
-        return self.X, self.y, self.feature_names
+        return self.X, self.y_encoded, self.feature_names
     
     def run_supervised_analysis(self, test_size=0.2, val_size=0.1, cv_folds=5, 
                               use_sample_aware_splitting=True, apply_augmentation=False):
@@ -170,7 +298,7 @@ class ResearchAnalyzer:
         apply_augmentation : bool
             Whether to apply feature augmentation
         """
-        if self.X is None or self.y is None:
+        if self.X is None or self.y_encoded is None:
             raise ValueError("Data not loaded. Call load_and_prepare_data() first.")
         
         print("Running enhanced supervised learning analysis...")
@@ -179,16 +307,16 @@ class ResearchAnalyzer:
         if use_sample_aware_splitting and self.features_df is not None:
             print("Using sample-aware splitting to prevent data leakage...")
             try:
-                train_idx, val_idx, test_idx = self.sample_splitter.split_by_samples(
+                train_idx, val_idx, test_idx, leak_summary = self.sample_splitter.split_by_samples(
                     self.features_df, test_size=test_size, val_size=val_size, 
-                    stratify_column='label'
+                    stratify_column='label', seed=42
                 )
                 
                 X_train, X_val, X_test = self.X[train_idx], self.X[val_idx], self.X[test_idx]
-                y_train, y_val, y_test = self.y[train_idx], self.y[val_idx], self.y[test_idx]
+                y_train, y_val, y_test = self.y_encoded[train_idx], self.y_encoded[val_idx], self.y_encoded[test_idx]
                 
-                # Validate split
-                self.sample_splitter.validate_split(self.features_df, train_idx, val_idx, test_idx)
+                # Validate split (already done in split_by_samples via leak_check)
+                print(f"Leak check: {'✓ PASSED' if leak_summary['is_valid'] else '✗ FAILED'}")
                 
             except Exception as e:
                 print(f"Sample-aware splitting failed ({e}), falling back to random splitting")
@@ -197,7 +325,7 @@ class ResearchAnalyzer:
         if not use_sample_aware_splitting:
             print("Using traditional random splitting...")
             X_temp, X_test, y_temp, y_test = train_test_split(
-                self.X, self.y, test_size=test_size, random_state=42, stratify=self.y
+                self.X, self.y_encoded, test_size=test_size, random_state=42, stratify=self.y_encoded
             )
             val_ratio = val_size / (1 - test_size)
             X_train, X_val, y_train, y_val = train_test_split(
@@ -220,7 +348,7 @@ class ResearchAnalyzer:
         
         # Train all supervised models
         self.results['supervised_results'] = self.supervised_models.train_all_models(
-            X_train_scaled, X_test_scaled, y_train, y_test, self.feature_names, cv_folds
+            X_train_scaled, X_test_scaled, y_train, y_test, self.feature_names, cv_folds, encoder=self.label_encoder
         )
         
         # Generate model comparison visualization
@@ -233,6 +361,346 @@ class ResearchAnalyzer:
         
         print("Enhanced supervised analysis complete!")
         return self.results['supervised_results']
+    
+    def _prepare_features_with_fusion(self, feature_mode='handcrafted', fusion_strategy='concatenate'):
+        """
+        Prepare features based on mode: handcrafted, deep-only, or hybrid.
+        
+        Parameters:
+        -----------
+        feature_mode : str
+            'handcrafted', 'deep_only', or 'hybrid'
+        fusion_strategy : str
+            'concatenate', 'weighted', or 'attention' (for hybrid mode)
+            
+        Returns:
+        --------
+        tuple : (X, feature_names)
+        """
+        if feature_mode == 'handcrafted':
+            return self.X, self.feature_names
+        
+        elif feature_mode == 'deep_only':
+            # Deep features should already be merged in load_and_prepare_data
+            if not hasattr(self, 'deep_feature_cols') or self.deep_feature_cols is None:
+                raise ValueError("Deep features not available. Ensure deep_features_path is provided and merge succeeded.")
+            
+            # Extract deep feature columns from already-merged dataframe
+            X_deep = self.features_df[self.deep_feature_cols].values
+            
+            # Scale deep features
+            scaler_deep = StandardScaler()
+            X_deep_scaled = scaler_deep.fit_transform(X_deep)
+            
+            print(f"Using deep-only features: {X_deep_scaled.shape}")
+            return X_deep_scaled, self.deep_feature_cols
+        
+        elif feature_mode == 'hybrid':
+            # Deep features should already be merged in load_and_prepare_data
+            if not hasattr(self, 'deep_feature_cols') or self.deep_feature_cols is None:
+                raise ValueError("Deep features not available for hybrid mode. Ensure deep_features_path is provided.")
+            
+            # Use existing handcrafted features (already extracted)
+            X_handcrafted = self.X
+            
+            # Extract deep features from already-merged dataframe
+            X_deep = self.features_df[self.deep_feature_cols].values
+            
+            # Scale both feature sets
+            scaler_hand = StandardScaler()
+            scaler_deep = StandardScaler()
+            X_handcrafted_scaled = scaler_hand.fit_transform(X_handcrafted)
+            X_deep_scaled = scaler_deep.fit_transform(X_deep)
+            
+            print(f"Hybrid features: handcrafted {X_handcrafted_scaled.shape}, deep {X_deep_scaled.shape}")
+            
+            # Fuse features
+            if fusion_strategy == 'concatenate':
+                X_fused = np.hstack([X_handcrafted_scaled, X_deep_scaled])
+                feature_names_fused = list(self.feature_names) + self.deep_feature_cols
+            elif fusion_strategy == 'weighted':
+                # Simple weighted combination (can be enhanced with learned weights)
+                # Normalize weights so they sum to 1
+                weight_hand = 0.5
+                weight_deep = 0.5
+                X_fused = np.hstack([X_handcrafted_scaled * weight_hand, X_deep_scaled * weight_deep])
+                feature_names_fused = list(self.feature_names) + self.deep_feature_cols
+            elif fusion_strategy == 'attention':
+                # Placeholder for attention-based fusion
+                # For now, use concatenate
+                X_fused = np.hstack([X_handcrafted_scaled, X_deep_scaled])
+                feature_names_fused = list(self.feature_names) + self.deep_feature_cols
+                print("Note: Attention fusion not yet implemented, using concatenate")
+            else:
+                # Default to concatenate
+                X_fused = np.hstack([X_handcrafted_scaled, X_deep_scaled])
+                feature_names_fused = list(self.feature_names) + self.deep_feature_cols
+            
+            print(f"Fused features: {X_fused.shape} (fusion strategy: {fusion_strategy})")
+            return X_fused, feature_names_fused
+        
+        else:
+            raise ValueError(f"Unknown feature_mode: {feature_mode}")
+    
+    def run_supervised_analysis_multiseed(self, test_size=0.2, val_size=0.1, cv_folds=5,
+                                         n_seeds=5, seeds=None, feature_mode='handcrafted',
+                                         fusion_strategy='concatenate', save_splits_dir=None,
+                                         use_saved_splits=False, stratify_column='label'):
+        """
+        Run supervised analysis across multiple seeds with support for different feature modes.
+        
+        Parameters:
+        -----------
+        test_size : float
+            Proportion of data for testing
+        val_size : float
+            Proportion of data for validation
+        cv_folds : int
+            Number of cross-validation folds
+        n_seeds : int
+            Number of seeds to use
+        seeds : List[int], optional
+            List of seeds to use
+        feature_mode : str
+            'handcrafted', 'deep_only', or 'hybrid'
+        fusion_strategy : str
+            'concatenate', 'weighted', or 'attention' (for hybrid mode)
+        save_splits_dir : str, optional
+            Directory to save/load splits
+        use_saved_splits : bool
+            If True, try to load saved splits
+        stratify_column : str
+            Column name for stratification
+            
+        Returns:
+        --------
+        dict : Results with 'aggregated' and 'per_seed' keys
+        """
+        if self.X is None or self.y_encoded is None:
+            raise ValueError("Data not loaded. Call load_and_prepare_data() first.")
+        
+        # Prepare features based on mode
+        X, feature_names = self._prepare_features_with_fusion(feature_mode, fusion_strategy)
+        
+        # Default seeds
+        if seeds is None:
+            seeds = [42, 123, 456, 789, 1011][:n_seeds]
+        
+        print(f"Running supervised analysis with {feature_mode} features across {len(seeds)} seeds...")
+        
+        # Create config hash
+        config_str = json.dumps({
+            'test_size': test_size,
+            'val_size': val_size,
+            'feature_mode': feature_mode,
+            'fusion_strategy': fusion_strategy,
+            'stratify_column': stratify_column
+        }, sort_keys=True)
+        config_hash = hashlib.sha256(config_str.encode()).hexdigest()[:16]
+        
+        # Create split key
+        class_list = self.class_names if self.class_names else sorted(np.unique(self.y_encoded).tolist())
+        data_hash = hashlib.sha256(str(sorted(self.features_df['filename'].values if 'filename' in self.features_df.columns else range(len(self.features_df)))).encode()).hexdigest()[:16]
+        split_key = self.sample_splitter.make_split_key(seeds[0], 'sample_aware', class_list, data_hash)
+        
+        per_seed_results = {}
+        all_metrics = {}
+        
+        for seed_idx, seed in enumerate(seeds):
+            print(f"\n{'='*80}")
+            print(f"Seed {seed_idx+1}/{len(seeds)}: {seed}")
+            print(f"{'='*80}")
+            
+            # Set global seed
+            set_global_seeds(seed)
+            
+            # Try to load splits if requested
+            train_idx = None
+            val_idx = None
+            test_idx = None
+            
+            if use_saved_splits and save_splits_dir:
+                split_dir = Path(save_splits_dir) / f"seed_{seed}"
+                loaded = self.sample_splitter.load_split_indices(str(split_dir), split_key)
+                if loaded:
+                    train_idx, val_idx, test_idx, metadata = loaded
+                    print(f"Loaded splits from {split_dir}")
+            
+            # Create splits if not loaded
+            if train_idx is None:
+                train_idx, val_idx, test_idx, leak_summary = self.sample_splitter.split_by_samples(
+                    self.features_df, test_size=test_size, val_size=val_size,
+                    stratify_column=stratify_column, seed=seed
+                )
+                
+                # Save splits if requested
+                if save_splits_dir:
+                    split_dir = Path(save_splits_dir) / f"seed_{seed}"
+                    split_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Compute label counts
+                    y_train_labels = self.y_encoded[train_idx]
+                    y_val_labels = self.y_encoded[val_idx]
+                    y_test_labels = self.y_encoded[test_idx]
+                    label_counts = {
+                        'train': {cls: int(np.sum(y_train_labels == i)) for i, cls in enumerate(class_list)},
+                        'val': {cls: int(np.sum(y_val_labels == i)) for i, cls in enumerate(class_list)},
+                        'test': {cls: int(np.sum(y_test_labels == i)) for i, cls in enumerate(class_list)}
+                    }
+                    
+                    self.sample_splitter.save_split_indices(
+                        train_idx, val_idx, test_idx,
+                        str(split_dir), config_hash, seed, split_key, leak_summary, label_counts
+                    )
+                    print(f"Saved splits to {split_dir}")
+            
+            # Get splits for this seed
+            X_train, X_val, X_test = X[train_idx], X[val_idx], X[test_idx]
+            y_train, y_val, y_test = self.y_encoded[train_idx], self.y_encoded[val_idx], self.y_encoded[test_idx]
+            
+            # Scale features (if not already scaled in _prepare_features_with_fusion)
+            if feature_mode == 'handcrafted':
+                self.scaler.fit(X_train)
+                X_train_scaled = self.scaler.transform(X_train)
+                X_val_scaled = self.scaler.transform(X_val)
+                X_test_scaled = self.scaler.transform(X_test)
+            else:
+                # Already scaled in _prepare_features_with_fusion
+                X_train_scaled, X_val_scaled, X_test_scaled = X_train, X_val, X_test
+            
+            # Train models
+            model_suite = SupervisedModelSuite(random_state=seed)
+            seed_results = model_suite.train_all_models(
+                X_train_scaled, X_test_scaled, y_train, y_test, feature_names, cv_folds, encoder=self.label_encoder
+            )
+            
+            per_seed_results[seed] = seed_results
+            
+            # Collect metrics
+            for model_name, results in seed_results.items():
+                if model_name not in all_metrics:
+                    all_metrics[model_name] = []
+                all_metrics[model_name].append({
+                    'accuracy': results['test_accuracy'],
+                    'macro_f1': results.get('macro_f1', results.get('f1_score', 0)),
+                    'macro_auc': results.get('macro_auc', results.get('test_auc'))
+                })
+        
+        # Aggregate results
+        aggregated_results = {}
+        for model_name, seed_metrics in all_metrics.items():
+            if not seed_metrics:
+                continue
+            
+            accuracies = [m['accuracy'] for m in seed_metrics if m['accuracy'] is not None]
+            macro_f1s = [m['macro_f1'] for m in seed_metrics if m['macro_f1'] is not None]
+            macro_aucs = [m['macro_auc'] for m in seed_metrics if m['macro_auc'] is not None]
+            
+            if accuracies:
+                acc_mean, acc_std, acc_ci_lower, acc_ci_upper = ci95(np.array(accuracies))
+            else:
+                acc_mean = acc_std = acc_ci_lower = acc_ci_upper = None
+            
+            if macro_f1s:
+                f1_mean, f1_std, f1_ci_lower, f1_ci_upper = ci95(np.array(macro_f1s))
+            else:
+                f1_mean = f1_std = f1_ci_lower = f1_ci_upper = None
+            
+            auc_mean = auc_std = auc_ci_lower = auc_ci_upper = None
+            if macro_aucs and all(a is not None for a in macro_aucs):
+                auc_mean, auc_std, auc_ci_lower, auc_ci_upper = ci95(np.array(macro_aucs))
+            
+            aggregated_results[model_name] = {
+                'accuracy': {'mean': acc_mean, 'std': acc_std, 'ci_lower': acc_ci_lower, 'ci_upper': acc_ci_upper},
+                'macro_f1': {'mean': f1_mean, 'std': f1_std, 'ci_lower': f1_ci_lower, 'ci_upper': f1_ci_upper},
+                'macro_auc': {'mean': auc_mean, 'std': auc_std, 'ci_lower': auc_ci_lower, 'ci_upper': auc_ci_upper} if auc_mean else None
+            }
+        
+        # Save aggregated results
+        results_summary = {
+            'aggregated': aggregated_results,
+            'per_seed': per_seed_results,
+            'config': {
+                'feature_mode': feature_mode,
+                'fusion_strategy': fusion_strategy,
+                'seeds': seeds,
+                'config_hash': config_hash
+            }
+        }
+        
+        # Serialize results
+        serialize_results(results_summary, {**self.config, **results_summary['config']}, 
+                         str(self.output_dir / "results"))
+        
+        # Store in results
+        self.results['supervised_results'] = results_summary
+        
+        return results_summary
+    
+    def generate_significance_summary(self, results_handcrafted=None, results_deep=None, results_hybrid=None,
+                                     output_path=None):
+        """
+        Generate significance summary comparing handcrafted, deep, and hybrid configurations.
+        
+        Parameters:
+        -----------
+        results_handcrafted : dict, optional
+            Results from handcrafted features (from run_supervised_analysis_multiseed)
+        results_deep : dict, optional
+            Results from deep-only features
+        results_hybrid : dict, optional
+            Results from hybrid features
+        output_path : str, optional
+            Path to save significance_summary.csv
+            
+        Returns:
+        --------
+        pd.DataFrame : Significance summary with comparisons
+        """
+        from research.evaluation.stat_tests import compare_configurations
+        
+        comparisons = []
+        
+        # Compare handcrafted vs deep
+        if results_handcrafted and results_deep:
+            if 'per_seed' in results_handcrafted and 'per_seed' in results_deep:
+                comp_df = compare_configurations(
+                    results_handcrafted['per_seed'], results_deep['per_seed'], metric='macro_f1'
+                )
+                comp_df['comparison'] = 'handcrafted_vs_deep'
+                comparisons.append(comp_df)
+        
+        # Compare handcrafted vs hybrid
+        if results_handcrafted and results_hybrid:
+            if 'per_seed' in results_handcrafted and 'per_seed' in results_hybrid:
+                comp_df = compare_configurations(
+                    results_handcrafted['per_seed'], results_hybrid['per_seed'], metric='macro_f1'
+                )
+                comp_df['comparison'] = 'handcrafted_vs_hybrid'
+                comparisons.append(comp_df)
+        
+        # Compare deep vs hybrid
+        if results_deep and results_hybrid:
+            if 'per_seed' in results_deep and 'per_seed' in results_hybrid:
+                comp_df = compare_configurations(
+                    results_deep['per_seed'], results_hybrid['per_seed'], metric='macro_f1'
+                )
+                comp_df['comparison'] = 'deep_vs_hybrid'
+                comparisons.append(comp_df)
+        
+        if comparisons:
+            summary_df = pd.concat(comparisons, ignore_index=True)
+            
+            if output_path:
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                summary_df.to_csv(output_path, index=False)
+                print(f"Saved significance summary to {output_path}")
+            
+            return summary_df
+        else:
+            print("Warning: No comparisons available for significance summary")
+            return pd.DataFrame()
     
     def run_anomaly_detection(self, contamination=0.1):
         """

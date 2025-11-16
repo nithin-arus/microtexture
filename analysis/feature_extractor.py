@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 import os
 from scipy.stats import entropy as scipy_entropy, skew, kurtosis
-from skimage.filters import sobel
+from skimage.filters import sobel, rank
 from skimage.feature import canny, graycomatrix, graycoprops, local_binary_pattern
-from skimage.morphology import disk
+from skimage.morphology import disk, square
 from skimage.measure import shannon_entropy
 import pywt
 import mahotas
@@ -26,7 +26,6 @@ def compute_basic_stats(image):
     return {
         'mean_intensity': np.mean(pixels),
         'std_dev': np.std(pixels),
-        'variance': np.var(pixels),
         'skewness': skew(pixels),
         'kurtosis': kurtosis(pixels),
         'range_intensity': np.max(pixels) - np.min(pixels),
@@ -35,14 +34,37 @@ def compute_basic_stats(image):
     }
 
 def compute_entropy_features(image):
-    """Compute various entropy measures"""
+    """
+    Compute various entropy measures.
+    
+    Local entropy computed via rank.entropy with 9x9 square structuring element.
+    Histogram bins=256, base=2, boundary handling='constant'.
+    """
     hist = cv2.calcHist([image], [0], None, [256], [0, 256]).flatten()
     hist_prob = hist / hist.sum()
     hist_prob = hist_prob[hist_prob > 0]  # Remove zeros to avoid log(0)
     
+    # Compute local entropy using rank.entropy with 9x9 window
+    try:
+        # Convert to uint8 if needed
+        if image.max() > 255:
+            image_uint8 = (image / image.max() * 255).astype(np.uint8)
+        elif image.max() <= 1.0:
+            image_uint8 = (image * 255).astype(np.uint8)
+        else:
+            image_uint8 = image.astype(np.uint8)
+        
+        # Compute local entropy map with 9x9 square structuring element
+        selem = square(9)
+        local_entropy_map = rank.entropy(image_uint8, selem)
+        entropy_local = np.mean(local_entropy_map)
+    except Exception as e:
+        # Fallback to shannon entropy if rank.entropy fails
+        entropy_local = shannon_entropy(image)
+    
     return {
         'entropy_shannon': scipy_entropy(hist_prob, base=2),
-        'entropy_local': shannon_entropy(image)
+        'entropy_local': entropy_local
     }
 
 def compute_edge_features(image):
@@ -82,16 +104,12 @@ def compute_haralick_features(image):
         glcm = graycomatrix(image_norm, distances=distances, angles=angles, 
                            levels=256, symmetric=True, normed=True)
         
-        # Calculate Haralick properties
+        # Calculate Haralick properties (excluding ASM which is duplicate of energy)
         features = {}
-        properties = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
+        properties = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation']
         
         for prop in properties:
-            if prop == 'ASM':
-                # Angular Second Moment
-                values = graycoprops(glcm, 'ASM')
-            else:
-                values = graycoprops(glcm, prop)
+            values = graycoprops(glcm, prop)
             features[f'haralick_{prop.lower()}'] = np.mean(values)
         
         return features
@@ -102,8 +120,7 @@ def compute_haralick_features(image):
             'haralick_dissimilarity': 0.0,
             'haralick_homogeneity': 0.0,
             'haralick_energy': 0.0,
-            'haralick_correlation': 0.0,
-            'haralick_asm': 0.0
+            'haralick_correlation': 0.0
         }
 
 def compute_lbp_features(image):
@@ -413,7 +430,8 @@ def extract_features(img_path, label=None, enable_fractal_fitting=True):
                     'fractal_equation': 'fitting_failed',
                     'fractal_hurst_exponent': 0.0,
                     'fractal_amplitude_scaling': 0.0,
-                    'fractal_goodness_of_fit': 0.0,
+                    'fractal_spectrum_corr': 0.0,
+                    'fractal_spectrum_rmse': 0.0,
                     'fractal_fitting_success': False,
                     'fractal_overlay_path': ''
                 })
@@ -445,3 +463,45 @@ def batch_extract_features(img_dir, label_map=None, enable_fractal_fitting=True)
             features = extract_features(fpath, label, enable_fractal_fitting)
             results.append(features)
     return pd.DataFrame(results)
+
+def get_feature_schema():
+    """
+    Return ordered list of handcrafted feature names.
+    
+    Returns:
+    --------
+    list : Ordered feature names (38 handcrafted features)
+        - 7 statistical: mean_intensity, std_dev, skewness, kurtosis, range_intensity, min_intensity, max_intensity
+        - 2 entropy: entropy_shannon, entropy_local
+        - 4 edge: edge_density, edge_magnitude_mean, edge_magnitude_std, edge_orientation_std
+        - 5 haralick: haralick_contrast, haralick_dissimilarity, haralick_homogeneity, haralick_energy, haralick_correlation
+        - 3 LBP: lbp_uniform_mean, lbp_variance, lbp_entropy
+        - 5 fractal: fractal_dim_higuchi, fractal_dim_katz, fractal_dim_dfa, fractal_dim_boxcount, lacunarity
+        - 5 wavelet: wavelet_energy_approx, wavelet_energy_horizontal, wavelet_energy_vertical, wavelet_energy_diagonal, wavelet_entropy
+        - 3 Tamura: tamura_coarseness, tamura_contrast, tamura_directionality
+        - 4 morphological: area_coverage, circularity, solidity, perimeter_complexity
+    """
+    return [
+        # Statistical features (7)
+        'mean_intensity', 'std_dev', 'skewness', 'kurtosis', 
+        'range_intensity', 'min_intensity', 'max_intensity',
+        # Entropy measures (2)
+        'entropy_shannon', 'entropy_local',
+        # Edge features (4)
+        'edge_density', 'edge_magnitude_mean', 'edge_magnitude_std', 'edge_orientation_std',
+        # Haralick features (5) - ASM removed (duplicate of energy)
+        'haralick_contrast', 'haralick_dissimilarity', 'haralick_homogeneity', 
+        'haralick_energy', 'haralick_correlation',
+        # LBP features (3)
+        'lbp_uniform_mean', 'lbp_variance', 'lbp_entropy',
+        # Fractal dimension measures (5)
+        'fractal_dim_higuchi', 'fractal_dim_katz', 'fractal_dim_dfa', 
+        'fractal_dim_boxcount', 'lacunarity',
+        # Wavelet features (5)
+        'wavelet_energy_approx', 'wavelet_energy_horizontal', 'wavelet_energy_vertical', 
+        'wavelet_energy_diagonal', 'wavelet_entropy',
+        # Tamura features (3)
+        'tamura_coarseness', 'tamura_contrast', 'tamura_directionality',
+        # Morphological features (4)
+        'area_coverage', 'circularity', 'solidity', 'perimeter_complexity'
+    ]

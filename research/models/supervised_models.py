@@ -7,9 +7,17 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import (accuracy_score, classification_report, 
                            confusion_matrix, roc_auc_score, f1_score)
+from sklearn.preprocessing import LabelEncoder
 import joblib
 import warnings
 warnings.filterwarnings('ignore')
+
+# Import standardized metrics
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from evaluation.metrics import compute_macro_f1, compute_macro_auc, validate_probabilities
+from evaluation.stat_tests import ci95
 
 try:
     import xgboost as xgb
@@ -54,6 +62,7 @@ class SupervisedModelSuite:
         )
         
         # Support Vector Machine - Linear
+        # Note: probability=True enables predict_proba but requires calibration (O(n^2) cost)
         self.models['svm_linear'] = SVC(
             kernel='linear',
             random_state=self.random_state,
@@ -62,6 +71,7 @@ class SupervisedModelSuite:
         )
         
         # Support Vector Machine - RBF
+        # Note: probability=True enables predict_proba but requires calibration (O(n^2) cost)
         self.models['svm_rbf'] = SVC(
             kernel='rbf',
             random_state=self.random_state,
@@ -100,23 +110,26 @@ class SupervisedModelSuite:
         )
         
         # XGBoost (if available)
+        # Note: objective and num_class will be set during training based on number of classes
         if XGBOOST_AVAILABLE:
             self.models['xgboost'] = xgb.XGBClassifier(
                 random_state=self.random_state,
-                eval_metric='logloss',
+                eval_metric='mlogloss',
                 use_label_encoder=False
             )
         
         # LightGBM (if available)
+        # Note: objective and num_class will be set during training based on number of classes
         if LIGHTGBM_AVAILABLE:
             self.models['lightgbm'] = lgb.LGBMClassifier(
                 random_state=self.random_state,
                 verbosity=-1
             )
     
-    def train_single_model(self, model_name, X_train, X_test, y_train, y_test, cv_folds=5):
+    def train_single_model(self, model_name, X_train, X_test, y_train, y_test, 
+                          cv_folds=5, encoder=None):
         """
-        Train a single model and evaluate performance
+        Train a single model and evaluate performance with standardized metrics.
         
         Parameters:
         -----------
@@ -125,20 +138,32 @@ class SupervisedModelSuite:
         X_train, X_test : np.ndarray
             Training and test feature matrices
         y_train, y_test : np.ndarray
-            Training and test target vectors
+            Training and test target vectors (integer-encoded)
         cv_folds : int
             Number of cross-validation folds
+        encoder : LabelEncoder, optional
+            Label encoder to infer number of classes for XGBoost/LightGBM
             
         Returns:
         --------
-        dict : Model results including accuracy, cross-validation scores, etc.
+        dict : Model results including accuracy, macro-F1, macro-AUC, etc.
         """
         if model_name not in self.models:
             raise ValueError(f"Model {model_name} not available")
         
         print(f"Training {model_name}...")
         
+        # Get model and configure for multi-class if needed
         model = self.models[model_name]
+        
+        # Infer number of classes
+        n_classes = len(np.unique(y_train))
+        
+        # Configure XGBoost and LightGBM for multi-class
+        if model_name == 'xgboost' and XGBOOST_AVAILABLE:
+            model.set_params(objective='multi:softprob', num_class=n_classes)
+        elif model_name == 'lightgbm' and LIGHTGBM_AVAILABLE:
+            model.set_params(objective='multiclass', num_class=n_classes)
         
         # Train the model
         model.fit(X_train, y_train)
@@ -148,27 +173,33 @@ class SupervisedModelSuite:
         y_pred_test = model.predict(X_test)
         
         # Get prediction probabilities (if available)
+        y_pred_proba_test = None
         try:
             y_pred_proba_test = model.predict_proba(X_test)
-        except:
+            # Validate probabilities
+            if y_pred_proba_test is not None:
+                validate_probabilities(y_pred_proba_test, n_classes)
+        except Exception as e:
+            print(f"  Warning: Could not get probabilities for {model_name}: {e}")
             y_pred_proba_test = None
         
-        # Calculate metrics
+        # Calculate standardized metrics
         train_accuracy = accuracy_score(y_train, y_pred_train)
         test_accuracy = accuracy_score(y_test, y_pred_test)
-        f1_test = f1_score(y_test, y_pred_test, average='weighted')
+        macro_f1_test = compute_macro_f1(y_test, y_pred_test)
+        
+        # Macro ROC-AUC (guarded)
+        macro_auc_test = None
+        if y_pred_proba_test is not None:
+            try:
+                macro_auc_test = compute_macro_auc(y_test, y_pred_proba_test)
+            except Exception as e:
+                print(f"  Warning: AUC computation failed for {model_name}: {e}")
+                macro_auc_test = None
         
         # Cross-validation
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state)
         cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='accuracy')
-        
-        # ROC AUC (for binary classification)
-        test_auc = None
-        if len(np.unique(y_test)) == 2 and y_pred_proba_test is not None:
-            try:
-                test_auc = roc_auc_score(y_test, y_pred_proba_test[:, 1])
-            except:
-                pass
         
         # Classification report
         class_report = classification_report(y_test, y_pred_test, output_dict=True)
@@ -182,22 +213,24 @@ class SupervisedModelSuite:
             'model_name': model_name,
             'train_accuracy': train_accuracy,
             'test_accuracy': test_accuracy,
-            'f1_score': f1_test,
+            'macro_f1': macro_f1_test,
+            'macro_auc': macro_auc_test,
             'cv_scores': cv_scores,
             'cv_mean': cv_scores.mean(),
             'cv_std': cv_scores.std(),
             'classification_report': class_report,
             'confusion_matrix': conf_matrix,
             'predictions_test': y_pred_test,
-            'predictions_proba_test': y_pred_proba_test,
-            'test_auc': test_auc
+            'predictions_proba_test': y_pred_proba_test
         }
         
-        print(f"  ✓ {model_name} - Test Accuracy: {test_accuracy:.4f}, CV: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+        auc_str = f"{macro_auc_test:.4f}" if macro_auc_test is not None else "N/A"
+        print(f"  ✓ {model_name} - Accuracy: {test_accuracy:.4f}, Macro-F1: {macro_f1_test:.4f}, Macro-AUC: {auc_str}")
         
         return results
     
-    def train_all_models(self, X_train, X_test, y_train, y_test, feature_names=None, cv_folds=5):
+    def train_all_models(self, X_train, X_test, y_train, y_test, feature_names=None, 
+                        cv_folds=5, encoder=None):
         """
         Train all available models and compare performance
         
@@ -206,11 +239,13 @@ class SupervisedModelSuite:
         X_train, X_test : np.ndarray
             Training and test feature matrices
         y_train, y_test : np.ndarray
-            Training and test target vectors
+            Training and test target vectors (integer-encoded)
         feature_names : list, optional
             Names of features
         cv_folds : int
             Number of cross-validation folds
+        encoder : LabelEncoder, optional
+            Label encoder to infer number of classes
             
         Returns:
         --------
@@ -223,7 +258,7 @@ class SupervisedModelSuite:
         for model_name in self.models.keys():
             try:
                 self.results[model_name] = self.train_single_model(
-                    model_name, X_train, X_test, y_train, y_test, cv_folds
+                    model_name, X_train, X_test, y_train, y_test, cv_folds, encoder
                 )
             except Exception as e:
                 print(f"  ✗ Error training {model_name}: {str(e)}")
@@ -233,6 +268,114 @@ class SupervisedModelSuite:
         self._compare_models()
         
         return self.results
+    
+    def train_all_models_multiseed(self, X_train, X_test, y_train, y_test, 
+                                   feature_names=None, cv_folds=5, n_seeds=5, 
+                                   seeds=None, encoder=None):
+        """
+        Train all models across multiple seeds and aggregate results.
+        
+        Parameters:
+        -----------
+        X_train, X_test : np.ndarray
+            Training and test feature matrices
+        y_train, y_test : np.ndarray
+            Training and test target vectors (integer-encoded)
+        feature_names : list, optional
+            Names of features
+        cv_folds : int
+            Number of cross-validation folds
+        n_seeds : int
+            Number of seeds to use (if seeds not provided)
+        seeds : List[int], optional
+            List of seeds to use. If None, uses default seeds.
+        encoder : LabelEncoder, optional
+            Label encoder to infer number of classes
+            
+        Returns:
+        --------
+        dict : Results with 'aggregated' and 'per_seed' keys
+        """
+        if seeds is None:
+            seeds = [42, 123, 456, 789, 1011][:n_seeds]
+        
+        print(f"Training {len(self.models)} models across {len(seeds)} seeds...")
+        
+        per_seed_results = {}
+        all_results = {model_name: [] for model_name in self.models.keys()}
+        
+        for seed in seeds:
+            print(f"\n=== Seed {seed} ===")
+            # Reinitialize models with new seed
+            old_random_state = self.random_state
+            self.random_state = seed
+            self._initialize_models()
+            
+            # Train all models
+            seed_results = self.train_all_models(
+                X_train, X_test, y_train, y_test, feature_names, cv_folds, encoder
+            )
+            
+            per_seed_results[seed] = seed_results
+            
+            # Collect metrics
+            for model_name, results in seed_results.items():
+                all_results[model_name].append({
+                    'accuracy': results['test_accuracy'],
+                    'macro_f1': results['macro_f1'],
+                    'macro_auc': results['macro_auc']
+                })
+            
+            # Restore random state
+            self.random_state = old_random_state
+        
+        # Aggregate results
+        aggregated_results = {}
+        for model_name, seed_metrics in all_results.items():
+            if not seed_metrics:
+                continue
+            
+            # Extract metric arrays
+            accuracies = [m['accuracy'] for m in seed_metrics if m['accuracy'] is not None]
+            macro_f1s = [m['macro_f1'] for m in seed_metrics if m['macro_f1'] is not None]
+            macro_aucs = [m['macro_auc'] for m in seed_metrics if m['macro_auc'] is not None]
+            
+            # Compute statistics
+            acc_mean, acc_std, acc_ci_lower, acc_ci_upper = ci95(np.array(accuracies))
+            f1_mean, f1_std, f1_ci_lower, f1_ci_upper = ci95(np.array(macro_f1s))
+            
+            auc_mean = None
+            auc_std = None
+            auc_ci_lower = None
+            auc_ci_upper = None
+            if macro_aucs and all(a is not None for a in macro_aucs):
+                auc_mean, auc_std, auc_ci_lower, auc_ci_upper = ci95(np.array(macro_aucs))
+            
+            aggregated_results[model_name] = {
+                'accuracy': {
+                    'mean': acc_mean,
+                    'std': acc_std,
+                    'ci_lower': acc_ci_lower,
+                    'ci_upper': acc_ci_upper
+                },
+                'macro_f1': {
+                    'mean': f1_mean,
+                    'std': f1_std,
+                    'ci_lower': f1_ci_lower,
+                    'ci_upper': f1_ci_upper
+                },
+                'macro_auc': {
+                    'mean': auc_mean,
+                    'std': auc_std,
+                    'ci_lower': auc_ci_lower,
+                    'ci_upper': auc_ci_upper
+                } if auc_mean is not None else None
+            }
+        
+        return {
+            'aggregated': aggregated_results,
+            'per_seed': per_seed_results
+        }
     
     def _compare_models(self):
         """Compare and rank models by performance"""
@@ -249,8 +392,8 @@ class SupervisedModelSuite:
                 'Test Accuracy': results['test_accuracy'],
                 'CV Mean': results['cv_mean'],
                 'CV Std': results['cv_std'],
-                'F1 Score': results['f1_score'],
-                'AUC': results['test_auc'] if results['test_auc'] else 'N/A'
+                'Macro F1': results.get('macro_f1', results.get('f1_score', 'N/A')),
+                'Macro AUC': results.get('macro_auc', results.get('test_auc', 'N/A'))
             })
         
         comparison_df = pd.DataFrame(comparison_data)

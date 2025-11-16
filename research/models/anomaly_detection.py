@@ -6,9 +6,20 @@ from sklearn.cluster import DBSCAN
 from sklearn.covariance import EllipticEnvelope
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (classification_report, confusion_matrix, 
+                            precision_recall_curve, roc_auc_score, roc_curve)
 import warnings
+import json
 warnings.filterwarnings('ignore')
+
+# Import plotting utilities
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from visualization.plots import plot_pr_curve
+except ImportError:
+    plot_pr_curve = None
 
 try:
     import tensorflow as tf
@@ -289,14 +300,18 @@ class AnomalyDetectionSuite:
         comparison_df = pd.DataFrame(comparison_data)
         print(comparison_df.to_string(index=False))
     
-    def evaluate_with_labels(self, true_labels):
+    def evaluate_with_labels(self, true_labels, output_dir=None, plot_pr_curves=True):
         """
-        Evaluate anomaly detection performance when ground truth is available
+        Evaluate anomaly detection performance when ground truth is available.
         
         Parameters:
         -----------
         true_labels : np.ndarray
             Ground truth labels (1 for anomaly, 0 for normal)
+        output_dir : str, optional
+            Directory to save PR curves
+        plot_pr_curves : bool
+            Whether to generate PR curves
             
         Returns:
         --------
@@ -304,6 +319,11 @@ class AnomalyDetectionSuite:
         """
         if not self.results:
             raise ValueError("No anomaly detection results available")
+        
+        # Report class distribution
+        class_dist = self.report_class_distribution(true_labels)
+        print("\nClass Distribution:")
+        print(f"  {class_dist['summary_text']}")
         
         print("\nAnomaly Detection Evaluation:")
         
@@ -321,6 +341,33 @@ class AnomalyDetectionSuite:
                 f1 = f1_score(true_labels, pred_labels, zero_division=0)
                 accuracy = accuracy_score(true_labels, pred_labels)
                 
+                # Compute ROC-AUC if scores available and labels are binary
+                roc_auc = None
+                if results['anomaly_scores'] is not None:
+                    try:
+                        # Check if we have valid binary labels
+                        unique_labels = np.unique(true_labels)
+                        if len(unique_labels) == 2:
+                            # Normalize scores to probabilities if needed
+                            scores = results['anomaly_scores'].copy()
+                            # For decision_function, lower values = more anomalous
+                            # For score_samples, lower values = more anomalous
+                            # Flip sign if needed to make higher = more anomalous
+                            if np.mean(scores[true_labels == 1]) < np.mean(scores[true_labels == 0]):
+                                scores = -scores
+                            roc_auc = roc_auc_score(true_labels, scores)
+                            
+                            # Generate PR curve if requested
+                            if plot_pr_curves and output_dir and plot_pr_curve:
+                                pr_path = Path(output_dir) / f'{model_name}_pr_curve.png'
+                                plot_pr_curve(true_labels, scores, str(pr_path), 
+                                            title=f'Precision-Recall Curve: {model_name}')
+                        else:
+                            print(f"  Warning: Cannot compute ROC-AUC for non-binary labels (found {len(unique_labels)} unique labels)")
+                    except Exception as e:
+                        print(f"  Warning: ROC-AUC computation failed: {e}")
+                        roc_auc = None
+                
                 evaluation_results[model_name] = {
                     'precision': precision,
                     'recall': recall,
@@ -329,14 +376,123 @@ class AnomalyDetectionSuite:
                     'confusion_matrix': confusion_matrix(true_labels, pred_labels)
                 }
                 
+                # Compute ROC-AUC if scores available and labels are binary
+                roc_auc = None
+                if results['anomaly_scores'] is not None:
+                    try:
+                        # Check if we have valid binary labels
+                        unique_labels = np.unique(true_labels)
+                        if len(unique_labels) == 2:
+                            # Normalize scores to probabilities if needed
+                            scores = results['anomaly_scores']
+                            # For decision_function, lower values = more anomalous
+                            # For score_samples, lower values = more anomalous
+                            # Flip sign if needed to make higher = more anomalous
+                            if np.mean(scores[true_labels == 1]) < np.mean(scores[true_labels == 0]):
+                                scores = -scores
+                            roc_auc = roc_auc_score(true_labels, scores)
+                        else:
+                            print(f"  Warning: Cannot compute ROC-AUC for non-binary labels (found {len(unique_labels)} unique labels)")
+                    except Exception as e:
+                        print(f"  Warning: ROC-AUC computation failed: {e}")
+                        roc_auc = None
+                
+                evaluation_results[model_name] = {
+                    'precision': precision,
+                    'recall': recall,
+                    'f1_score': f1,
+                    'accuracy': accuracy,
+                    'roc_auc': roc_auc,
+                    'confusion_matrix': confusion_matrix(true_labels, pred_labels)
+                }
+                
                 print(f"{model_name.replace('_', ' ').title()}:")
                 print(f"  Precision: {precision:.4f}")
                 print(f"  Recall: {recall:.4f}")
-                print(f"  F1-Score: {f1:.4f}")
+                print(f"  F1 Score: {f1:.4f}")
                 print(f"  Accuracy: {accuracy:.4f}")
+                if roc_auc is not None:
+                    print(f"  ROC-AUC: {roc_auc:.4f}")
+                else:
+                    print(f"  ROC-AUC: N/A (no valid scores or non-binary labels)")
                 print()
         
         return evaluation_results
+    
+    def tune_threshold(self, scores: np.ndarray, y_true: np.ndarray) -> dict:
+        """
+        Tune threshold to maximize F1 score.
+        
+        Parameters:
+        -----------
+        scores : np.ndarray
+            Anomaly scores (higher = more anomalous)
+        y_true : np.ndarray
+            True binary labels (1 for anomaly, 0 for normal)
+            
+        Returns:
+        --------
+        dict : Threshold tuning results with:
+            - threshold: Optimal threshold
+            - precision: Precision at optimal threshold
+            - recall: Recall at optimal threshold
+            - f1_score: F1 score at optimal threshold
+        """
+        # Compute precision-recall curve
+        precision, recall, thresholds = precision_recall_curve(y_true, scores)
+        
+        # Compute F1 for each threshold
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+        
+        # Find threshold that maximizes F1
+        best_idx = np.argmax(f1_scores)
+        best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else thresholds[-1]
+        best_f1 = f1_scores[best_idx]
+        best_precision = precision[best_idx]
+        best_recall = recall[best_idx]
+        
+        return {
+            'threshold': float(best_threshold),
+            'precision': float(best_precision),
+            'recall': float(best_recall),
+            'f1_score': float(best_f1)
+        }
+    
+    def report_class_distribution(self, y_true: np.ndarray) -> dict:
+        """
+        Report class distribution for anomaly detection labels.
+        
+        Parameters:
+        -----------
+        y_true : np.ndarray
+            True binary labels (1 for anomaly, 0 for normal)
+            
+        Returns:
+        --------
+        dict : Class distribution statistics with:
+            - total_samples: Total number of samples
+            - n_normal: Number of normal samples
+            - n_anomaly: Number of anomaly samples
+            - pct_normal: Percentage of normal samples
+            - pct_anomaly: Percentage of anomaly samples
+            - summary_text: Human-readable summary
+        """
+        total = len(y_true)
+        n_normal = np.sum(y_true == 0)
+        n_anomaly = np.sum(y_true == 1)
+        pct_normal = (n_normal / total) * 100 if total > 0 else 0
+        pct_anomaly = (n_anomaly / total) * 100 if total > 0 else 0
+        
+        summary = {
+            'total_samples': int(total),
+            'n_normal': int(n_normal),
+            'n_anomaly': int(n_anomaly),
+            'pct_normal': float(pct_normal),
+            'pct_anomaly': float(pct_anomaly),
+            'summary_text': f"Total: {total}, Normal: {n_normal} ({pct_normal:.2f}%), Anomaly: {n_anomaly} ({pct_anomaly:.2f}%)"
+        }
+        
+        return summary
     
     def get_anomaly_feature_analysis(self, X, feature_names=None, model_name='isolation_forest'):
         """

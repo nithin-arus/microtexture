@@ -1,4 +1,7 @@
 # Core dependencies for data collection and feature extraction
+# NOTE: For reproducibility, generate requirements-frozen.txt using: pip freeze > requirements-frozen.txt
+# This file uses >= for flexibility during development. For production/reproduction, use requirements-frozen.txt
+
 opencv-python>=4.8.0
 numpy>=1.24.0
 pandas>=2.0.0
@@ -27,9 +30,14 @@ optuna>=3.0.0                # For hyperparameter optimization
 imbalanced-learn>=0.9.0      # For SMOTE and feature augmentation
 
 # Advanced visualization
-umap-learn>=0.5.0            # For UMAP dimensionality reduction
 plotly>=5.0.0                # For interactive visualizations
 
 # Optional explainability dependencies (install as needed)
 # shap>=0.41.0               # For SHAP explainability
-# lime>=0.2.0                # For LIME explainability 
+# lime>=0.2.0                # For LIME explainability
+
+# To generate frozen requirements for reproducibility:
+# 1. Create a fresh virtual environment
+# 2. Install all dependencies: pip install -r requirements.txt
+# 3. Generate frozen file: pip freeze > requirements-frozen.txt
+# 4. Use requirements-frozen.txt for exact reproduction 

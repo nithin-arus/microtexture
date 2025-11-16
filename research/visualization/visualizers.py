@@ -7,6 +7,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from utils.captions import build_caption
+except ImportError:
+    build_caption = None
 
 class ResearchVisualizer:
     """
@@ -36,16 +42,16 @@ class ResearchVisualizer:
         plt.style.use('default')
         sns.set_palette("husl")
         
-        # Configure matplotlib for better plots
+        # Configure matplotlib for better plots (readable fonts, high DPI)
         plt.rcParams.update({
             'figure.figsize': (10, 6),
             'font.size': 12,
-            'axes.titlesize': 14,
             'axes.labelsize': 12,
+            'legend.fontsize': 11,
+            'figure.dpi': 300,
+            'figure.titlesize': 14,
             'xtick.labelsize': 10,
-            'ytick.labelsize': 10,
-            'legend.fontsize': 10,
-            'figure.dpi': 150
+            'ytick.labelsize': 10
         })
     
     def plot_model_comparison(self, supervised_results):
@@ -120,8 +126,22 @@ class ResearchVisualizer:
                                      cv_means, f1_scores)
         
         plt.tight_layout()
+        # Add caption if available
+        caption_text = ""
+        if build_caption and hasattr(self, 'plot_config'):
+            try:
+                caption_text = build_caption(self.plot_config, {'metrics': ['accuracy', 'f1_score'], 'averaging': 'macro'})
+                plt.figtext(0.5, 0.01, caption_text, ha='center', fontsize=9, wrap=True)
+            except:
+                pass
+        
         plt.savefig(self.output_dir / 'model_comparison.png', dpi=300, bbox_inches='tight')
         plt.close()
+        
+        # Save caption separately
+        if caption_text:
+            with open(self.output_dir / 'model_comparison_caption.txt', 'w') as f:
+                f.write(caption_text)
         
         # Create confusion matrices for best models
         self._plot_confusion_matrices(supervised_results)

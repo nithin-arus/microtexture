@@ -14,18 +14,38 @@ Usage:
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import train_test_split, cross_val_score
+import sys
+import argparse
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
 import warnings
 warnings.filterwarnings('ignore')
 
-def load_and_prepare_data(csv_path):
-    """Load and prepare the feature data"""
+# Import new utilities
+from research.utils.sample_aware_splitting import SampleAwareSplitter
+from research.utils.determinism import set_global_seeds
+from research.utils.schema_migration import auto_fix_schema
+from research.utils.data_manifest import encode_labels
+from research.evaluation.metrics import compute_macro_f1, compute_macro_auc
+from research.evaluation.stat_tests import ci95
+
+def load_and_prepare_data(csv_path, migrate_schema=True):
+    """Load and prepare the feature data with schema migration"""
     print("Loading data from:", csv_path)
     df = pd.read_csv(csv_path)
+    
+    # Migrate schema if requested
+    if migrate_schema:
+        print("Migrating feature schema...")
+        df = auto_fix_schema(df, log_migrations=True)
 
     # Get all feature columns (exclude metadata and string columns)
     metadata_cols = ['filename', 'path', 'label', 'fractal_overlay_path', 'fractal_equation']
@@ -56,20 +76,20 @@ def load_and_prepare_data(csv_path):
     X = np.nan_to_num(X, nan=0.0)
 
     # Encode labels
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
+    y_encoded, label_encoder, class_names = encode_labels(y)
 
     print(f"Loaded {X.shape[0]} samples with {X.shape[1]} features")
-    print(f"Classes: {le.classes_}")
+    print(f"Classes: {class_names}")
 
-    return X, y_encoded, le.classes_, all_features, df
+    return X, y_encoded, class_names, all_features, df, label_encoder
 
 def define_feature_categories():
-    """Define feature categories for ablation study"""
+    """Define feature categories for ablation study (updated to remove redundant features)"""
     return {
         'statistical': [
-            'mean_intensity', 'std_dev', 'variance', 'skewness', 'kurtosis',
+            'mean_intensity', 'std_dev', 'skewness', 'kurtosis',
             'range_intensity', 'min_intensity', 'max_intensity'
+            # Note: variance removed (duplicate of std_dev)
         ],
         'entropy': [
             'entropy_shannon', 'entropy_local'
@@ -79,7 +99,8 @@ def define_feature_categories():
         ],
         'haralick': [
             'haralick_contrast', 'haralick_dissimilarity', 'haralick_homogeneity',
-            'haralick_energy', 'haralick_correlation', 'haralick_asm'
+            'haralick_energy', 'haralick_correlation'
+            # Note: haralick_asm removed (duplicate of energy)
         ],
         'lbp': [
             'lbp_uniform_mean', 'lbp_variance', 'lbp_entropy'
@@ -87,7 +108,8 @@ def define_feature_categories():
         'fractal': [
             'fractal_dim_higuchi', 'fractal_dim_katz', 'fractal_dim_dfa',
             'fractal_dim_boxcount', 'lacunarity', 'fractal_hurst_exponent',
-            'fractal_amplitude_scaling', 'fractal_goodness_of_fit'
+            'fractal_amplitude_scaling', 'fractal_spectrum_corr', 'fractal_spectrum_rmse'
+            # Note: fractal_goodness_of_fit replaced with fractal_spectrum_corr and fractal_spectrum_rmse
         ],
         'wavelet': [
             'wavelet_energy_approx', 'wavelet_energy_horizontal', 'wavelet_energy_vertical',
@@ -140,67 +162,93 @@ def get_feature_indices(feature_names, selected_categories, feature_categories):
 
     return indices, selected_features
 
-def evaluate_feature_set(X_train, X_test, y_train, y_test, feature_indices, ablation_name):
-    """Evaluate a specific feature set combination"""
-    print(f"Evaluating: {ablation_name}")
-
+def evaluate_feature_set_multiseed(X, y_encoded, df, feature_indices, ablation_name, 
+                                   train_idx, test_idx, seeds=[42], model_name='Random Forest'):
+    """Evaluate a specific feature set combination across multiple seeds"""
+    
     # Select features
-    X_train_subset = X_train[:, feature_indices]
-    X_test_subset = X_test[:, feature_indices]
-
-    if X_train_subset.shape[1] == 0:
+    X_subset = X[:, feature_indices]
+    
+    if X_subset.shape[1] == 0:
         print(f"  No features found for {ablation_name}")
         return None
-
-    print(f"  Using {X_train_subset.shape[1]} features")
-
-    # Train and evaluate models
-    models = {
-        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-        'SVM': SVC(kernel='rbf', random_state=42, probability=True)
-    }
-
-    results = {}
-
-    for model_name, model in models.items():
+    
+    all_seed_results = []
+    
+    for seed in seeds:
+        set_global_seeds(seed)
+        
+        # Get splits
+        X_train = X_subset[train_idx]
+        X_test = X_subset[test_idx]
+        y_train = y_encoded[train_idx]
+        y_test = y_encoded[test_idx]
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
         try:
             # Train model
-            model.fit(X_train_subset, y_train)
-
+            if model_name == 'Random Forest':
+                model = RandomForestClassifier(n_estimators=100, random_state=seed)
+            elif model_name == 'SVM':
+                model = SVC(kernel='rbf', random_state=seed, probability=True)
+            else:
+                model = RandomForestClassifier(n_estimators=100, random_state=seed)
+            
+            model.fit(X_train_scaled, y_train)
+            
             # Make predictions
-            y_pred = model.predict(X_test_subset)
-
+            y_pred = model.predict(X_test_scaled)
+            
             # Calculate metrics
             accuracy = accuracy_score(y_test, y_pred)
-            macro_f1 = f1_score(y_test, y_pred, average='macro')
-
+            macro_f1 = compute_macro_f1(y_test, y_pred)
+            
             # Calculate AUROC
+            macro_auc = None
             if hasattr(model, 'predict_proba'):
-                y_proba = model.predict_proba(X_test_subset)
+                y_proba = model.predict_proba(X_test_scaled)
                 try:
-                    auroc = roc_auc_score(y_test, y_proba, multi_class='ovr', average='macro')
+                    macro_auc = compute_macro_auc(y_test, y_proba)
                 except:
-                    auroc = None
-            else:
-                auroc = None
-
-            # Cross-validation score
-            cv_scores = cross_val_score(model, X_train_subset, y_train, cv=3, scoring='accuracy')
-            cv_mean = cv_scores.mean()
-
-            results[model_name] = {
+                    macro_auc = None
+            
+            all_seed_results.append({
                 'accuracy': accuracy,
                 'macro_f1': macro_f1,
-                'auroc': auroc,
-                'cv_mean': cv_mean,
-                'n_features': X_train_subset.shape[1]
-            }
-
+                'macro_auc': macro_auc,
+                'n_features': X_train_scaled.shape[1]
+            })
+            
         except Exception as e:
-            print(f"  Error with {model_name}: {e}")
-            results[model_name] = None
-
-    return results
+            print(f"  Error with {model_name} (seed {seed}): {e}")
+            continue
+    
+    if not all_seed_results:
+        return None
+    
+    # Aggregate results
+    accuracies = [r['accuracy'] for r in all_seed_results]
+    macro_f1s = [r['macro_f1'] for r in all_seed_results]
+    macro_aucs = [r['macro_auc'] for r in all_seed_results if r['macro_auc'] is not None]
+    
+    acc_mean, acc_std, acc_ci_lower, acc_ci_upper = ci95(np.array(accuracies))
+    f1_mean, f1_std, f1_ci_lower, f1_ci_upper = ci95(np.array(macro_f1s))
+    
+    auc_mean = auc_std = auc_ci_lower = auc_ci_upper = None
+    if macro_aucs and len(macro_aucs) == len(seeds):
+        auc_mean, auc_std, auc_ci_lower, auc_ci_upper = ci95(np.array(macro_aucs))
+    
+    return {
+        'accuracy': {'mean': acc_mean, 'std': acc_std, 'ci_lower': acc_ci_lower, 'ci_upper': acc_ci_upper},
+        'macro_f1': {'mean': f1_mean, 'std': f1_std, 'ci_lower': f1_ci_lower, 'ci_upper': f1_ci_upper},
+        'macro_auc': {'mean': auc_mean, 'std': auc_std, 'ci_lower': auc_ci_lower, 'ci_upper': auc_ci_upper} if auc_mean else None,
+        'n_features': X_subset.shape[1],
+        'per_seed': all_seed_results
+    }
 
 def create_ablation_table(results_dict, ablation_sets, feature_categories):
     """Create ablation study table"""
